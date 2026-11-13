@@ -562,6 +562,9 @@ internal sealed class MainWindow : Window
         advanced.Children.Add(Card("诊断", null,
             Button("复制诊断信息", () => DesktopIntegration.CopyText(details.DiagnosticText))));
 
+        var testStatus = Text("尚未测试", 13);
+        content.Children.Add(testStatus);
+        string? lastSample = sample;
         var image = new Image { Height = 160, Stretch = Stretch.Uniform, Visibility = Visibility.Collapsed };
         var result = Text("", 12);
         bool testing = false;
@@ -604,14 +607,21 @@ internal sealed class MainWindow : Window
                     return;
                 }
 
+                lastSample = path;
+                testStatus.Text = "正在测试…";
                 result.Text = "正在生成缩略图…";
                 image.Visibility = Visibility.Collapsed;
                 using var bitmap = await Task.Run(() => ThumbnailShell.Extract(path, true));
                 image.Source = await DesktopIntegration.ToImageSourceAsync(bitmap);
                 image.Visibility = Visibility.Visible;
+                testStatus.Text = "已生成缩略图";
                 result.Text = $"{System.IO.Path.GetFileName(path)}  ·  {bitmap.Width} × {bitmap.Height} 像素";
             }
-            catch (Exception ex) { result.Text = $"无法测试缩略图：{ex.Message}"; }
+            catch (Exception ex)
+            {
+                testStatus.Text = "这份文件生成失败";
+                result.Text = $"无法生成缩略图（0x{ex.HResult:X8}）。";
+            }
             finally { testing = false; }
         }
 
@@ -620,9 +630,12 @@ internal sealed class MainWindow : Window
             var file = await DesktopIntegration.PickTestFileAsync(this);
             if (file != null) await TestPath(file);
         });
-        previewCard = Card("看看缩略图是否正常", "把一个文件拖进窗口，或选择文件测试。", test);
+        previewCard = Card("缩略图测试", "把一个文件拖进窗口，或选择文件测试。");
+        var repair = AsyncButton("尝试修复", () => GuardRepair(details.Extension, details.IconsOnly, details.Effective, details.Providers, () => lastSample, TestPath), true);
+        undo.Content = "撤销上次修改";
         previewCard.Children.Add(result);
         previewCard.Children.Add(image);
+        previewCard.Children.Add(Actions(test, repair, undo));
         content.Children.Add(previewCard);
         testCurrentFile = TestPath;
         if (sample != null) _ = TestPath(sample);
@@ -642,12 +655,6 @@ internal sealed class MainWindow : Window
         AddFact(facts, "用户覆盖", details.HasOverride ? "已设置" : "未设置");
         info.Children.Add(facts);
         content.Children.Add(info);
-
-        var repair = Button("修复缩略图", () => GuardRepair(extension, details.IconsOnly, details.Effective, details.Providers), true);
-        undo.Content = "撤销上次修改";
-        content.Children.Add(Card("修复缩略图", details.IconsOnly
-            ? "资源管理器目前只显示文件图标，可以恢复缩略图显示。"
-            : "如果文件只显示图标，可以尝试修复当前文件类型。", repair, undo));
 
         content.Children.Add(Text("高级设置", 18));
         content.Children.Add(advanced);
@@ -674,7 +681,7 @@ internal sealed class MainWindow : Window
         Place(grid, field, row);
     }
 
-    private async void GuardRepair(string type, bool iconsOnly, ThumbnailSettings.Provider? current, ThumbnailSettings.Provider[] candidates)
+    private async Task GuardRepair(string type, bool iconsOnly, ThumbnailSettings.Provider? current, ThumbnailSettings.Provider[] candidates, Func<string?> sample, Func<string, Task> owner)
     {
         try
         {
@@ -695,9 +702,16 @@ internal sealed class MainWindow : Window
                 PrimaryButtonText = "修复",
                 CloseButtonText = "取消"
             };
-            if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+            if (await dialog.ShowAsync() != ContentDialogResult.Primary || testCurrentFile != owner) return;
             bool changed = iconsOnly ? settings.EnableThumbnails() : settings.Apply(type, alternatives[0]);
-            Changed(changed, "已更新设置。请选择一个文件，验证缩略图能否生成。");
+            if (!changed)
+            {
+                Tell("配置无需更新。", InfoBarSeverity.Informational);
+                return;
+            }
+            var previous = sample();
+            RenderDetails(settings.Inspect(type), previous);
+            Tell(previous == null ? "已更新设置。请选择文件验证。" : "已更新设置，正在用同一文件复测。", InfoBarSeverity.Informational);
         }
         catch (Exception ex) { Tell(ex.Message, InfoBarSeverity.Warning); }
     }
@@ -1029,36 +1043,3 @@ internal sealed class MainWindow : Window
     private static TextBlock Text(string text, double size) => new() { Text = text, FontSize = size, TextWrapping = TextWrapping.Wrap };
     private static void Place(Grid grid, FrameworkElement child, int row) { Grid.SetRow(child, row); grid.Children.Add(child); }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
