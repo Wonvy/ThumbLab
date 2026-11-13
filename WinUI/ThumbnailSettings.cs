@@ -265,8 +265,12 @@ internal sealed class ThumbnailSettings
         string server = raw is null ? "" : Environment.ExpandEnvironmentVariables(raw.Trim().Trim('"'));
         if (!string.IsNullOrWhiteSpace(server) && Path.GetFileName(server) == server)
             server = Path.Combine(Environment.SystemDirectory, server);
-        return new Provider(guid, Read(merged, key, "DisplayName") ?? Read(merged, key) ?? "缩略图处理器",
-            server, Path.IsPathFullyQualified(server) && File.Exists(server));
+        string? name = Read(merged, key, "DisplayName");
+        if (string.IsNullOrWhiteSpace(name)) name = Read(merged, key);
+        if (string.IsNullOrWhiteSpace(name)) name = Read(merged, key + @"\ProgID");
+        if (string.IsNullOrWhiteSpace(name)) name = Path.GetFileNameWithoutExtension(server);
+        if (string.IsNullOrWhiteSpace(name)) name = "缩略图处理器";
+        return new Provider(guid, name, server, Path.IsPathFullyQualified(server) && File.Exists(server));
     }
 
     private static Entry ReadEntry(string key, string name)

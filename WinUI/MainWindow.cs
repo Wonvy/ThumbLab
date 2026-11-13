@@ -34,6 +34,9 @@ internal sealed class MainWindow : Window
     private ThumbnailSettings.FileType[] fileTypes = Array.Empty<ThumbnailSettings.FileType>();
     private string extension = ".pdf";
     private Button? inspectSearch;
+    private StackPanel? emptyTypes;
+    private TextBlock? emptyMessage;
+    private Button? showAllTypes;
     private Button? multiExport;
     private TextBlock? exportHint;
     private Button? exportEntry;
@@ -89,10 +92,13 @@ internal sealed class MainWindow : Window
 
         Place(sidebar, types, 3);
         inspectSearch = Button("检查此扩展名", InspectSearch);
-        inspectSearch.VerticalAlignment = VerticalAlignment.Top;
-        inspectSearch.HorizontalAlignment = HorizontalAlignment.Stretch;
-        inspectSearch.Visibility = Visibility.Collapsed;
-        Place(sidebar, inspectSearch, 3);
+        emptyTypes = new StackPanel { Spacing = 8, VerticalAlignment = VerticalAlignment.Top, Visibility = Visibility.Collapsed };
+        emptyMessage = Text("", 13);
+        showAllTypes = Button("查看全部", () => SetFilter(2));
+        emptyTypes.Children.Add(emptyMessage);
+        emptyTypes.Children.Add(showAllTypes);
+        emptyTypes.Children.Add(inspectSearch);
+        Place(sidebar, emptyTypes, 3);
         var leftPane = (Border)Microsoft.UI.Xaml.Markup.XamlReader.Load(
             @"<Border xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Background='{ThemeResource LayerFillColorDefaultBrush}' />");
         leftPane.Child = sidebar;
@@ -354,6 +360,18 @@ internal sealed class MainWindow : Window
     private void SetFilter(int index)
     {
         filterIndex = index;
+        var glyph = new FontIcon { Glyph = "\uE71C", FontSize = 16 };
+        var filterMark = new Grid();
+        filterMark.Children.Add(glyph);
+        if (index != 2)
+            filterMark.Children.Add(new Microsoft.UI.Xaml.Shapes.Ellipse
+            {
+                Width = 6, Height = 6, HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Top,
+                Margin = new Thickness(0, -2, -4, 0),
+                Fill = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 75, 156, 245))
+            });
+        typeFilter.Content = filterMark;
         if (typeFilter.Tag is ToggleMenuFlyoutItem[] choices)
             for (int i = 0; i < choices.Length; i++) choices[i].IsChecked = i == index;
         string label = "筛选：" + FilterNames[index];
@@ -379,6 +397,12 @@ internal sealed class MainWindow : Window
                     catch (InvalidOperationException) { }
                 }
                 inspectSearch.Visibility = canInspect ? Visibility.Visible : Visibility.Collapsed;
+            }
+            if (emptyTypes != null && emptyMessage != null && showAllTypes != null)
+            {
+                emptyTypes.Visibility = !loading && rows.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+                emptyMessage.Text = filterIndex == 2 ? "没有匹配的文件类型" : "当前筛选无结果";
+                showAllTypes.Visibility = filterIndex == 2 ? Visibility.Collapsed : Visibility.Visible;
             }
             types.ItemsSource = rows;
             if (selectingForExport)
@@ -484,7 +508,9 @@ internal sealed class MainWindow : Window
 
     private void RenderDetails(ThumbnailSettings.Details details, string? sample = null)
     {
-        Begin("manage", details.Extension, showFileIcon: true);
+        var testStatus = Text("尚未测试", 13);
+        testStatus.VerticalAlignment = VerticalAlignment.Center;
+        Begin("manage", details.Extension, showFileIcon: true, status: testStatus);
         var advanced = new StackPanel { Spacing = 8, Padding = new Thickness(0, 8, 0, 0) };
         var picker = new ComboBox { MinWidth = 220, MaxWidth = 470, ItemsSource = details.Providers };
         picker.SelectedItem = details.Providers.FirstOrDefault(item => item.Exists && item.Id != details.Effective?.Id)
@@ -549,24 +575,17 @@ internal sealed class MainWindow : Window
         picker.MaxWidth = double.PositiveInfinity;
         locations.HorizontalAlignment = HorizontalAlignment.Stretch;
         locations.MaxWidth = double.PositiveInfinity;
-        var processor = Card("处理器", null);
-        processor.Children.Add(picker);
-        processor.Children.Add(Actions(apply, reset, locate));
-        advanced.Children.Add(processor);
+        advanced.Children.Add(Text("处理器", 14));
+        advanced.Children.Add(picker);
+        advanced.Children.Add(Actions(apply, reset, locate));
+        advanced.Children.Add(Text("注册表", 14));
+        advanced.Children.Add(locations);
+        advanced.Children.Add(Actions(open, copy));
 
-        var registry = Card("注册表", null);
-        registry.Children.Add(locations);
-        registry.Children.Add(Actions(open, copy));
-        advanced.Children.Add(registry);
 
-        advanced.Children.Add(Card("诊断", null,
-            Button("复制诊断信息", () => DesktopIntegration.CopyText(details.DiagnosticText))));
-
-        var testStatus = Text("尚未测试", 13);
-        content.Children.Add(testStatus);
         string? lastSample = sample;
         var image = new Image { Height = 160, Stretch = Stretch.Uniform, Visibility = Visibility.Collapsed };
-        var result = Text("", 12);
+        var result = Text("", 13);
         bool testing = false;
         StackPanel? previewCard = null;
         async Task TestPath(string path)
@@ -609,6 +628,7 @@ internal sealed class MainWindow : Window
 
                 lastSample = path;
                 testStatus.Text = "正在测试…";
+                ToolTipService.SetToolTip(result, null);
                 result.Text = "正在生成缩略图…";
                 image.Visibility = Visibility.Collapsed;
                 using var bitmap = await Task.Run(() => ThumbnailShell.Extract(path, true));
@@ -620,7 +640,10 @@ internal sealed class MainWindow : Window
             catch (Exception ex)
             {
                 testStatus.Text = "这份文件生成失败";
-                result.Text = $"无法生成缩略图（0x{ex.HResult:X8}）。";
+                result.Text = details.IconsOnly
+                    ? "资源管理器目前只显示图标。可点击「尝试修复」恢复缩略图显示。"
+                    : "Windows 无法为这份文件生成缩略图。可尝试修复，或换一份同类型的文件。";
+                ToolTipService.SetToolTip(result, $"Windows 错误 0x{ex.HResult:X8}");
             }
             finally { testing = false; }
         }
@@ -633,8 +656,8 @@ internal sealed class MainWindow : Window
         previewCard = Card("缩略图测试", "把一个文件拖进窗口，或选择文件测试。");
         var repair = AsyncButton("尝试修复", () => GuardRepair(details.Extension, details.IconsOnly, details.Effective, details.Providers, () => lastSample, TestPath), true);
         undo.Content = "撤销上次修改";
-        previewCard.Children.Add(result);
         previewCard.Children.Add(image);
+        previewCard.Children.Add(result);
         previewCard.Children.Add(Actions(test, repair, undo));
         content.Children.Add(previewCard);
         testCurrentFile = TestPath;
@@ -656,8 +679,10 @@ internal sealed class MainWindow : Window
         info.Children.Add(facts);
         content.Children.Add(info);
 
-        content.Children.Add(Text("高级设置", 18));
-        content.Children.Add(advanced);
+        var advancedCard = Card("高级设置", null,
+            Button("复制诊断信息", () => DesktopIntegration.CopyText(details.DiagnosticText)));
+        advancedCard.Children.Add(advanced);
+        content.Children.Add(advancedCard);
     }
 
     private void AddFact(Grid grid, string label, string value, Action? open = null)
@@ -879,7 +904,7 @@ internal sealed class MainWindow : Window
         title.ButtonHoverForegroundColor = title.ButtonPressedForegroundColor = foreground;
     }
 
-    private void Begin(string page, string title, bool showFileIcon = false)
+    private void Begin(string page, string title, bool showFileIcon = false, TextBlock? status = null)
     {
         bool reset = currentPage != page;
         currentPage = page;
@@ -891,6 +916,7 @@ internal sealed class MainWindow : Window
             var icon = new Image { Width = 24, Height = 24, VerticalAlignment = VerticalAlignment.Center, Visibility = Visibility.Collapsed };
             header.Children.Add(icon);
             header.Children.Add(heading);
+            if (status != null) header.Children.Add(status);
             content.Children.Add(header);
             LoadHeadingIcon(title, icon);
         }
