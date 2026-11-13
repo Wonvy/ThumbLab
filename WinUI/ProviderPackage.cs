@@ -19,6 +19,7 @@ internal sealed class ProviderPackage : IDisposable
     private const string Classes = @"Software\Classes\CLSID\";
     private const long MaxFile = 64L * 1024 * 1024;
     private const long MaxTotal = 256L * 1024 * 1024;
+    internal const int MaxBackupConfiguration = 2_000_000;
     private const int MaxManifest = 128 * 1024;
     private static readonly StringComparer IgnoreCase = StringComparer.OrdinalIgnoreCase;
     private readonly ZipArchive archive;
@@ -46,17 +47,26 @@ internal sealed class ProviderPackage : IDisposable
         ZipArchive? zip = null;
         try
         {
-            if (input.Length > MaxTotal + MaxManifest) throw BadPackage("文件过大。");
+            if (input.Length > MaxTotal + MaxManifest + 4 * MaxBackupConfiguration) throw BadPackage("文件过大。");
             zip = new ZipArchive(input, ZipArchiveMode.Read);
-            if (zip.Entries.Count > 257) throw BadPackage("文件数量超过上限。");
+            if (zip.Entries.Count > 8192) throw BadPackage("文件数量超过上限。");
             var archiveFiles = new Dictionary<string, ZipArchiveEntry>(IgnoreCase);
+            long expandedSize = 0;
             foreach (var entry in zip.Entries)
             {
                 ValidatePath(entry.FullName);
+                if (entry.Length > MaxFile || entry.Length > MaxTotal + MaxManifest + 4 * MaxBackupConfiguration - expandedSize)
+                    throw BadPackage("解压大小超过上限。");
+                expandedSize += entry.Length;
                 if (!archiveFiles.TryAdd(entry.FullName, entry) || (entry.ExternalAttributes & 0x400) != 0 ||
                     ((uint)entry.ExternalAttributes >> 28) == 0xA)
                     throw BadPackage("存在重复文件或链接。");
             }
+            if (archiveFiles.Remove("config.thumblab", out var configuration) && configuration.Length > MaxBackupConfiguration)
+                throw BadPackage("备份配置文件过大。");
+            // Backup-only files are never eligible for extraction or registration.
+            foreach (var name in archiveFiles.Keys.Where(name => name.StartsWith("backup-only/", StringComparison.OrdinalIgnoreCase)).ToArray())
+                archiveFiles.Remove(name);
             if (!archiveFiles.Remove("manifest.json", out var manifest) || manifest.Length > MaxManifest)
                 throw BadPackage("缺少有效的 manifest.json。");
             using var reader = manifest.Open();
@@ -68,7 +78,15 @@ internal sealed class ProviderPackage : IDisposable
             if (root.GetProperty("version").GetInt32() != 1) throw BadPackage("版本不受支持。");
 
             var declarations = root.GetProperty("files");
-            if (declarations.GetArrayLength() != archiveFiles.Count || archiveFiles.Count == 0)
+            if (root.TryGetProperty("extensionFolderBackup", out var layout) && layout.ValueKind == JsonValueKind.True)
+            {
+                var declared = declarations.EnumerateArray().Select(item => Field(item, "path")).ToHashSet(IgnoreCase);
+                foreach (var name in archiveFiles.Keys.Where(name => !declared.Contains(name) &&
+                    (name.Equals("restore-all.reg", StringComparison.OrdinalIgnoreCase) ||
+                     (name.StartsWith(".") && name.Count(character => character == '/') == 1))).ToArray())
+                    archiveFiles.Remove(name);
+            }
+            if (declarations.GetArrayLength() != archiveFiles.Count || archiveFiles.Count == 0 || archiveFiles.Count > 256)
                 throw BadPackage("文件列表与包内文件不匹配。");
             var knownFiles = new HashSet<string>(IgnoreCase);
             long total = 0;
@@ -89,13 +107,13 @@ internal sealed class ProviderPackage : IDisposable
             }
 
             var components = root.GetProperty("providers");
-            if (components.GetArrayLength() is < 1 or > 32) throw BadPackage("处理器数量超出范围。");
+            if (components.GetArrayLength() is < 1 or > 32) throw BadPackage("预览处理程序数量超出范围。");
             var classIds = new HashSet<string>(IgnoreCase);
             var extensions = new HashSet<string>(IgnoreCase);
             var providers = components.EnumerateArray().Select(item =>
             {
                 string name = Field(item, "name");
-                if (name.Length > 120 || name.Any(char.IsControl)) throw BadPackage("处理器名称无效。");
+                if (name.Length > 120 || name.Any(char.IsControl)) throw BadPackage("预览处理程序名称无效。");
                 if (!Guid.TryParse(Field(item, "clsid"), out var id) || id == Guid.Empty || !classIds.Add(id.ToString("B")))
                     throw BadPackage("CLSID 无效或重复。");
                 string model = Field(item, "threadingModel");
@@ -103,13 +121,13 @@ internal sealed class ProviderPackage : IDisposable
                     throw BadPackage("线程模型无效。");
                 string dll = Field(item, "dll");
                 if (!dll.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || !knownFiles.Contains(dll))
-                    throw BadPackage("找不到声明的处理器 DLL。");
+                    throw BadPackage("找不到声明的预览处理程序 DLL。");
                 var values = item.GetProperty("extensions");
                 if (values.GetArrayLength() is < 1 or > 128) throw BadPackage("扩展名数量超出范围。");
                 var normalized = values.EnumerateArray().Select(value =>
                 {
                     string extension = ThumbnailSettings.Normalize(value.GetString() ?? "");
-                    if (!extensions.Add(extension)) throw BadPackage("同一个扩展名不能关联多个处理器。");
+                    if (!extensions.Add(extension)) throw BadPackage("同一个扩展名不能关联多个预览处理程序。");
                     return extension;
                 }).ToArray();
                 return new Provider(name, id.ToString("B").ToUpperInvariant(), model, dll, normalized);
@@ -293,7 +311,7 @@ internal sealed class ProviderPackage : IDisposable
             throw BadPackage("组件哈希校验失败。");
     }
 
-    private static bool IsX64(string path)
+    internal static bool IsX64(string path)
     {
         using var input = File.OpenRead(path);
         using var reader = new BinaryReader(input);
@@ -305,7 +323,7 @@ internal sealed class ProviderPackage : IDisposable
         return reader.ReadUInt32() == 0x00004550 && reader.ReadUInt16() == 0x8664;
     }
 
-    private static bool HasTrustedSignature(string path)
+    internal static bool HasTrustedSignature(string path)
     {
         var file = new TrustFile { Size = (uint)Marshal.SizeOf<TrustFile>(), Path = path };
         IntPtr info = Marshal.AllocHGlobal(Marshal.SizeOf<TrustFile>());
@@ -335,11 +353,15 @@ internal sealed class ProviderPackage : IDisposable
         }
     }
 
-    private static void ValidatePath(string name)
+    internal static void ValidatePath(string name)
     {
         if (name.Length is < 1 or > 190) throw BadPackage("组件路径无效。");
-        foreach (string segment in name.Split('/'))
+        var segments = name.Split('/');
+        for (int index = 0; index < segments.Length; index++)
         {
+            string segment = segments[index];
+            if (index == 0 && segments.Length > 1 && Regex.IsMatch(segment, @"\A\.[a-zA-Z0-9][a-zA-Z0-9_.+-]{0,31}\z") && !segment.EndsWith('.'))
+                continue;
             if (!Regex.IsMatch(segment, @"\A[A-Za-z0-9_][A-Za-z0-9_. -]{0,95}\z") || segment.EndsWith('.') || segment.EndsWith(' ')
                 || Regex.IsMatch(segment.Split('.')[0].TrimEnd(), @"\A(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\z", RegexOptions.IgnoreCase))
                 throw BadPackage("组件路径不安全。");
@@ -378,4 +400,3 @@ internal sealed class ProviderPackage : IDisposable
     [DllImport("wintrust.dll", ExactSpelling = true)]
     private static extern int WinVerifyTrust(IntPtr window, ref Guid action, ref TrustData data);
 }
-

@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.IO;
+using System.Text;
 using System.Runtime.InteropServices;
 
 internal sealed class FileTypeIcons : IDisposable
@@ -27,21 +29,40 @@ internal sealed class FileTypeIcons : IDisposable
 
     private static Bitmap LoadIcon(string extension, bool large)
     {
-        ShellFileInfo info;
-        IntPtr result = SHGetFileInfo(extension, FileAttributeNormal, out info,
-            (uint)Marshal.SizeOf(typeof(ShellFileInfo)), GetIcon | UseFileAttributes | (large ? 0u : SmallIcon));
-        if (info.Icon == IntPtr.Zero) return null;
-
+        // Read the icon registration without invoking the file type's Shell extensions.
+        var value = new StringBuilder(32768);
+        uint length = (uint)value.Capacity;
+        IntPtr handle = IntPtr.Zero;
+        if (AssocQueryString(0, 15, extension, null, value, ref length) == 0)
+        {
+            string location = Environment.ExpandEnvironmentVariables(value.ToString().Trim());
+            int separator = location.LastIndexOf(',');
+            int index = 0;
+            if (separator >= 0 && int.TryParse(location.Substring(separator + 1).Trim(), out index))
+                location = location.Substring(0, separator);
+            location = location.Trim().Trim('"');
+            if (Path.IsPathRooted(location) && !location.StartsWith(@"\") && File.Exists(location))
+            {
+                var result = new IntPtr[1];
+                ExtractIconEx(location, index, large ? result : null, large ? null : result, 1);
+                handle = result[0];
+            }
+        }
+        if (handle == IntPtr.Zero)
+        {
+            // A neutral name obtains the Windows stock file icon.
+            ShellFileInfo info;
+            SHGetFileInfo("ThumbLab-unassociated", FileAttributeNormal, out info,
+                (uint)Marshal.SizeOf(typeof(ShellFileInfo)), GetIcon | UseFileAttributes | (large ? 0u : SmallIcon));
+            handle = info.Icon;
+        }
+        if (handle == IntPtr.Zero) return null;
         try
         {
-            if (result == IntPtr.Zero) return null;
-            using (var icon = Icon.FromHandle(info.Icon))
+            using (var icon = Icon.FromHandle(handle))
                 return icon.ToBitmap();
         }
-        finally
-        {
-            DestroyIcon(info.Icon);
-        }
+        finally { DestroyIcon(handle); }
     }
 
     public void Clear()
@@ -71,8 +92,13 @@ internal sealed class FileTypeIcons : IDisposable
     [DllImport("shell32.dll", EntryPoint = "SHGetFileInfoW", CharSet = CharSet.Unicode, ExactSpelling = true)]
     private static extern IntPtr SHGetFileInfo(string path, uint attributes, out ShellFileInfo info, uint size, uint flags);
 
+    [DllImport("shlwapi.dll", EntryPoint = "AssocQueryStringW", CharSet = CharSet.Unicode)]
+    private static extern int AssocQueryString(uint flags, uint kind, string association, string extra, StringBuilder output, ref uint length);
+
+    [DllImport("shell32.dll", EntryPoint = "ExtractIconExW", CharSet = CharSet.Unicode)]
+    private static extern uint ExtractIconEx(string file, int index, [Out] IntPtr[] large, [Out] IntPtr[] small, uint count);
+
     [DllImport("user32.dll", ExactSpelling = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool DestroyIcon(IntPtr icon);
 }
-

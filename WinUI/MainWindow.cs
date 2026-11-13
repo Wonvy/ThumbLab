@@ -13,7 +13,7 @@ using System.Linq;
 
 namespace ThumbLabWinUI;
 
-internal sealed class MainWindow : Window
+internal sealed partial class MainWindow : Window
 {
     private readonly ThumbnailSettings settings = new();
     private readonly FileTypeIcons icons = new();
@@ -21,7 +21,7 @@ internal sealed class MainWindow : Window
         @"<Grid xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Background='{ThemeResource ApplicationPageBackgroundThemeBrush}' />");
     private readonly ListView types = new() { SelectionMode = ListViewSelectionMode.Single, IsMultiSelectCheckBoxEnabled = false };
     private readonly TextBox search = new() { PlaceholderText = "搜索扩展名", BorderThickness = new Thickness(0) };
-    private static readonly string[] FilterNames = { "有缩略图处理器", "无缩略图处理器", "全部文件类型" };
+    private static readonly string[] FilterNames = { "有预览处理程序", "无预览处理程序", "全部文件类型" };
     private readonly Button typeFilter = new() { Content = new FontIcon { Glyph = "\uE71C", FontSize = 16 }, Width = 40 };
     private int filterIndex;
     private readonly HashSet<string> exportSelection = new(StringComparer.OrdinalIgnoreCase);
@@ -48,6 +48,10 @@ internal sealed class MainWindow : Window
 
     public MainWindow()
     {
+        var preferences = BrowsePreferences.Load();
+        extension = preferences.Extension;
+        int preferredLeftWidth = preferences.LeftWidth;
+        bool iconView = preferences.IconView;
         Title = "ThumbLab";
         Content = root;
 
@@ -58,7 +62,7 @@ internal sealed class MainWindow : Window
             area.X + (area.Width - width) / 2,
             area.Y + (area.Height - windowHeight) / 2, width, windowHeight));
         SetWindowIcon();
-        var leftColumn = new ColumnDefinition { Width = new GridLength(315) };
+        var leftColumn = new ColumnDefinition { Width = new GridLength(preferredLeftWidth) };
         root.ColumnDefinitions.Add(leftColumn);
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(8) });
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -77,18 +81,18 @@ internal sealed class MainWindow : Window
         Grid.SetColumn(typeFilter, 1);
         filters.Children.Add(typeFilter);
         filters.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        var view = IconButton(new Button(), "\uE80A", "切换到图标视图");
+        var view = IconButton(new Button(), iconView ? "\uEA37" : "\uE80A",
+            iconView ? "切换到列表视图" : "切换到图标视图");
         Grid.SetColumn(view, 2);
         filters.Children.Add(view);
-        bool iconView = false;
         view.Click += (_, _) => Guard(() =>
         {
+            SetTypeView(!iconView);
             iconView = !iconView;
-            SetTypeView(iconView);
             SetIcon(view, iconView ? "\uEA37" : "\uE80A", iconView ? "切换到列表视图" : "切换到图标视图");
         });
         Place(sidebar, filters, 1);
-        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(typeFilter, "按缩略图处理器筛选");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(typeFilter, "按预览处理程序筛选");
 
         Place(sidebar, types, 3);
         inspectSearch = Button("检查此扩展名", InspectSearch);
@@ -110,8 +114,9 @@ internal sealed class MainWindow : Window
         bool resizing = false;
         void ResizeLeft(double x)
         {
-            double max = Math.Max(205, root.ActualWidth - 360);
-            leftColumn.Width = new GridLength(Math.Clamp(x, 205, max));
+            int minimum = BrowsePreferences.MinimumLeftWidth;
+            double max = Math.Max(minimum, root.ActualWidth - 360);
+            leftColumn.Width = new GridLength(Math.Clamp(x, minimum, max));
         }
         splitter.PointerPressed += (_, e) =>
         {
@@ -121,11 +126,13 @@ internal sealed class MainWindow : Window
         };
         splitter.PointerMoved += (_, e) =>
         {
-            if (resizing) ResizeLeft(e.GetCurrentPoint(root).Position.X);
+            if (!resizing) return;
+            ResizeLeft(e.GetCurrentPoint(root).Position.X);
+            preferredLeftWidth = (int)Math.Round(leftColumn.Width.Value);
         };
         splitter.PointerReleased += (_, e) => splitter.ReleasePointerCapture(e.Pointer);
         splitter.PointerCaptureLost += (_, _) => resizing = false;
-        root.SizeChanged += (_, _) => ResizeLeft(leftColumn.Width.Value);
+        root.SizeChanged += (_, _) => ResizeLeft(preferredLeftWidth);
         root.Children.Add(splitter);
         scroller.Content = content;
         Grid.SetColumn(scroller, 2);
@@ -137,7 +144,7 @@ internal sealed class MainWindow : Window
         var import = importEntry = IconButton(new Button(), "\uE896", "导入");
         var imports = new MenuFlyout();
         AddMenuAction(imports, "导入配置", ImportAsync);
-        AddMenuAction(imports, "导入组件包", ImportPackageAsync);
+        AddMenuAction(imports, "导入备份或组件包", ImportPackageAsync);
         import.Flyout = imports;
         var export = IconButton(AsyncButton("", async () =>
         {
@@ -180,7 +187,7 @@ internal sealed class MainWindow : Window
             types.Resources["ListViewItemBackground" + state] = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 0, 91, 166));
             types.Resources["ListViewItemForeground" + state] = new SolidColorBrush(Colors.White);
         }
-        SetTypeView(false);
+        SetTypeView(iconView);
         types.ContainerContentChanging += ShowTypeIcon;
         SetupFileDrop();
         types.SelectionChanged += (_, e) =>
@@ -218,7 +225,12 @@ internal sealed class MainWindow : Window
         root.ActualThemeChanged += (_, _) => UpdateTitleBar();
         root.Loaded += (_, _) => UpdateTitleBar();
 
-        Closed += (_, _) => icons.Dispose();
+        Closed += (_, _) =>
+        {
+            windowClosed = true;
+            new BrowsePreferences(preferredLeftWidth, iconView, extension).Save();
+            icons.Dispose();
+        };
         ShowLoading();
         root.Loaded += AfterLoaded;
     }
@@ -251,7 +263,18 @@ internal sealed class MainWindow : Window
         }
         finally { loading = false; }
 
-        Filter();
+        if (windowClosed) return;
+        var restoredType = fileTypes.FirstOrDefault(item =>
+            item.Extension.Equals(initialType, StringComparison.OrdinalIgnoreCase));
+        if (restoredType != null && filterIndex == 0 && !restoredType.HasThumbnail)
+            SetFilter(2);
+        else
+            Filter();
+        if (types.SelectedItem is TypeRow restoredRow)
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                if (ReferenceEquals(types.SelectedItem, restoredRow)) ScrollToType(restoredRow);
+            });
         if (currentPage == "manage")
         {
             if (initial != null) Guard(() => RenderDetails(initial));
@@ -263,6 +286,7 @@ internal sealed class MainWindow : Window
         }
     }
 
+    private bool windowClosed;
     private System.Drawing.Icon? windowIcon;
 
     private void SetWindowIcon()
@@ -339,22 +363,44 @@ internal sealed class MainWindow : Window
         finally { filtering = false; }
         Filter();
         var selected = types.SelectedItems.OfType<TypeRow>().FirstOrDefault(row => row.Name.Equals(extension, StringComparison.OrdinalIgnoreCase));
-        if (selected != null) DispatcherQueue.TryEnqueue(() => types.ScrollIntoView(selected));
+        if (selected != null) DispatcherQueue.TryEnqueue(() => ScrollToType(selected));
+    }
+
+    private void ScrollToType(object item)
+    {
+        if (windowClosed || !types.IsLoaded || !types.Items.Contains(item)) return;
+        try { types.ScrollIntoView(item); }
+        catch (System.Runtime.InteropServices.COMException error) { System.Diagnostics.Debug.WriteLine(error); }
     }
 
     private void ShowTypeIcon(ListViewBase sender, ContainerContentChangingEventArgs args)
     {
-        if (args.InRecycleQueue || args.Item is not TypeRow item) return;
-        args.ItemContainer.ContextFlyout = FileTypeMenu(item.Name);
-        args.RegisterUpdateCallback(async (list, update) =>
+        if (windowClosed || args.InRecycleQueue || args.Item is not TypeRow item) return;
+        var container = args.ItemContainer;
+        container.ContextFlyout = FileTypeMenu(item.Name);
+        args.RegisterUpdateCallback((list, update) =>
         {
-            if (update.ItemContainer.ContentTemplateRoot is not Grid grid || grid.Children[0] is not Image image) return;
+            if (update.InRecycleQueue || windowClosed) return;
+            _ = RenderTypeIconAsync(update.ItemContainer, item);
+        });
+    }
+
+    private async Task RenderTypeIconAsync(Microsoft.UI.Xaml.Controls.Primitives.SelectorItem container, TypeRow item)
+    {
+        try
+        {
+            if (windowClosed || !ReferenceEquals(container.Content, item)
+                || container.ContentTemplateRoot is not Grid grid || grid.Children.Count < 2
+                || grid.Children[0] is not Image image) return;
             if (grid.Children[1] is TextBlock label) label.Text = item.Name;
             image.Source = item.Icon;
             if (item.Icon == null && icons.Get(item.Name, large: image.Width > 16) is { } bitmap)
-                try { item.Icon = await DesktopIntegration.ToImageSourceAsync(bitmap); } catch { return; }
-            if (ReferenceEquals(update.ItemContainer.Content, item)) image.Source = item.Icon;
-        });
+                item.Icon = await DesktopIntegration.ToImageSourceAsync(bitmap);
+            if (!windowClosed && ReferenceEquals(container.Content, item)
+                && ReferenceEquals(container.ContentTemplateRoot, grid))
+                image.Source = item.Icon;
+        }
+        catch (Exception error) { System.Diagnostics.Debug.WriteLine(error); }
     }
 
     private void SetFilter(int index)
@@ -408,6 +454,7 @@ internal sealed class MainWindow : Window
             if (selectingForExport)
             {
                 foreach (var row in rows.Where(row => exportSelection.Contains(row.Name))) types.SelectedItems.Add(row);
+                UpdateExportHint();
             }
             else types.SelectedItem = rows.FirstOrDefault(row => row.Name.Equals(extension, StringComparison.OrdinalIgnoreCase));
         }
@@ -506,7 +553,7 @@ internal sealed class MainWindow : Window
         await testCurrentFile(path);
     }
 
-    private void RenderDetails(ThumbnailSettings.Details details, string? sample = null)
+    private void RenderDetails(ThumbnailSettings.Details details, string? sample = null, string? repairChange = null)
     {
         var testStatus = Text("尚未测试", 13);
         testStatus.VerticalAlignment = VerticalAlignment.Center;
@@ -515,10 +562,10 @@ internal sealed class MainWindow : Window
         var picker = new ComboBox { MinWidth = 220, MaxWidth = 470, ItemsSource = details.Providers };
         picker.SelectedItem = details.Providers.FirstOrDefault(item => item.Exists && item.Id != details.Effective?.Id)
             ?? details.Providers.FirstOrDefault();
-        var apply = Button("应用处理器", () =>
+        var apply = Button("应用预览处理程序", () =>
         {
             if (picker.SelectedItem is not ThumbnailSettings.Provider chosen) return;
-            Changed(settings.Apply(extension, chosen), "已应用处理器。");
+            Changed(settings.Apply(extension, chosen), "已应用预览处理程序。");
         }, true);
         apply.IsEnabled = picker.SelectedItem is ThumbnailSettings.Provider { Exists: true };
         var reset = Button("移除用户覆盖", () => Changed(settings.Reset(extension), "已移除用户覆盖。"));
@@ -575,7 +622,7 @@ internal sealed class MainWindow : Window
         picker.MaxWidth = double.PositiveInfinity;
         locations.HorizontalAlignment = HorizontalAlignment.Stretch;
         locations.MaxWidth = double.PositiveInfinity;
-        advanced.Children.Add(Text("处理器", 14));
+        advanced.Children.Add(Text("预览处理程序", 14));
         advanced.Children.Add(picker);
         advanced.Children.Add(Actions(apply, reset, locate));
         advanced.Children.Add(Text("注册表", 14));
@@ -634,13 +681,13 @@ internal sealed class MainWindow : Window
                 using var bitmap = await Task.Run(() => ThumbnailShell.Extract(path, true));
                 image.Source = await DesktopIntegration.ToImageSourceAsync(bitmap);
                 image.Visibility = Visibility.Visible;
-                testStatus.Text = "已生成缩略图";
+                testStatus.Text = repairChange == null ? "已生成缩略图" : "修复后已生成缩略图";
                 result.Text = $"{System.IO.Path.GetFileName(path)}  ·  {bitmap.Width} × {bitmap.Height} 像素";
             }
             catch (Exception ex)
             {
                 testStatus.Text = "这份文件生成失败";
-                result.Text = details.IconsOnly
+                result.Text = repairChange != null ? "设置已更新，但这份文件仍无法生成缩略图。可撤销上次修改。" : details.IconsOnly
                     ? "资源管理器目前只显示图标。可点击「尝试修复」恢复缩略图显示。"
                     : "Windows 无法为这份文件生成缩略图。可尝试修复，或换一份同类型的文件。";
                 ToolTipService.SetToolTip(result, $"Windows 错误 0x{ex.HResult:X8}");
@@ -656,6 +703,7 @@ internal sealed class MainWindow : Window
         previewCard = Card("缩略图测试", "把一个文件拖进窗口，或选择文件测试。");
         var repair = AsyncButton("尝试修复", () => GuardRepair(details.Extension, details.IconsOnly, details.Effective, details.Providers, () => lastSample, TestPath), true);
         undo.Content = "撤销上次修改";
+        if (repairChange != null) previewCard.Children.Add(Text(repairChange, 13));
         previewCard.Children.Add(image);
         previewCard.Children.Add(result);
         previewCard.Children.Add(Actions(test, repair, undo));
@@ -669,7 +717,7 @@ internal sealed class MainWindow : Window
         var facts = new Grid { ColumnSpacing = 14, RowSpacing = 8 };
         facts.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(110) });
         facts.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        AddFact(facts, "缩略图处理器", current?.Name ?? "未找到");
+        AddFact(facts, "预览处理程序", current?.Name ?? "未找到");
         Action? openDll = current?.Exists == true && !string.IsNullOrEmpty(file)
             ? () => DesktopIntegration.SelectProviderFile(file) : null;
         AddFact(facts, "DLL 位置", string.IsNullOrWhiteSpace(file) ? "未找到" : file, openDll);
@@ -679,10 +727,8 @@ internal sealed class MainWindow : Window
         info.Children.Add(facts);
         content.Children.Add(info);
 
-        var advancedCard = Card("高级设置", null,
-            Button("复制诊断信息", () => DesktopIntegration.CopyText(details.DiagnosticText)));
-        advancedCard.Children.Add(advanced);
-        content.Children.Add(advancedCard);
+        content.Children.Add(advanced);
+        content.Children.Add(Actions(Button("复制诊断信息", () => DesktopIntegration.CopyText(details.DiagnosticText))));
     }
 
     private void AddFact(Grid grid, string label, string value, Action? open = null)
@@ -735,8 +781,10 @@ internal sealed class MainWindow : Window
                 return;
             }
             var previous = sample();
-            RenderDetails(settings.Inspect(type), previous);
-            Tell(previous == null ? "已更新设置。请选择文件验证。" : "已更新设置，正在用同一文件复测。", InfoBarSeverity.Informational);
+            RenderDetails(settings.Inspect(type), previous, iconsOnly
+                ? "已允许资源管理器显示缩略图。"
+                : $"已切换到 {alternatives[0].Name}。");
+
         }
         catch (Exception ex) { Tell(ex.Message, InfoBarSeverity.Warning); }
     }
@@ -745,6 +793,13 @@ internal sealed class MainWindow : Window
     {
         var path = await DesktopIntegration.PickPackageAsync(this);
         if (path == null) return;
+        using var backupConfig = BackupConfiguration.Open(path, out bool hasComponents);
+        if (!hasComponents)
+        {
+            if (backupConfig == null) throw new InvalidOperationException("ZIP 中没有可导入的配置或组件。");
+            await ApplyConfigFileAsync(backupConfig.Path);
+            return;
+        }
         using var package = await Task.Run(() => ProviderPackage.Prepare(path));
         var dialog = new ContentDialog
         {
@@ -752,14 +807,22 @@ internal sealed class MainWindow : Window
             XamlRoot = root.XamlRoot,
             Content = new ScrollViewer { MaxHeight = 360, Content = Text(package.Summary, 14) },
             PrimaryButtonText = "安装并应用",
+            SecondaryButtonText = backupConfig == null ? "" : "仅恢复配置",
             CloseButtonText = "取消"
         };
-        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+        var decision = await dialog.ShowAsync();
+        if (decision == ContentDialogResult.Secondary && backupConfig != null)
+        {
+            await ApplyConfigFileAsync(backupConfig.Path);
+            return;
+        }
+        if (decision != ContentDialogResult.Primary) return;
         bool changed = package.Install(settings.ApplyPackage);
         ShowDetails();
         Tell(changed ? "已应用组件关联。请选一个样本文件测试。" : "组件关联无需更新。", InfoBarSeverity.Success);
         fileTypes = await Task.Run(ThumbnailSettings.LoadFileTypes);
         Filter();
+        if (backupConfig != null) await ApplyConfigFileAsync(backupConfig.Path);
     }
 
     private void ToggleExportSelection()
@@ -784,7 +847,7 @@ internal sealed class MainWindow : Window
                 DispatcherQueue.TryEnqueue(() =>
                 {
                     if (selectingForExport && types.SelectedItems.Contains(selected))
-                        types.ScrollIntoView(selected, ScrollIntoViewAlignment.Leading);
+                        ScrollToType(selected);
                 });
             }
         }
@@ -805,7 +868,7 @@ internal sealed class MainWindow : Window
         }
         if (exportHint != null)
         {
-            exportHint.Text = $"已选 {exportSelection.Count} 项。勾选文件类型后，点击「保存配置」。";
+            UpdateExportHint();
             exportHint.Visibility = selectingForExport ? Visibility.Visible : Visibility.Collapsed;
         }
         if (multiExport != null)
@@ -813,6 +876,14 @@ internal sealed class MainWindow : Window
             multiExport.Content = "取消";
             multiExport.Visibility = selectingForExport ? Visibility.Visible : Visibility.Collapsed;
         }
+    }
+
+    private void UpdateExportHint()
+    {
+        if (exportHint == null || !selectingForExport) return;
+        int hidden = exportSelection.Count - types.SelectedItems.Count;
+        exportHint.Text = $"已选 {exportSelection.Count} 项" + (hidden > 0 ? $"，其中 {hidden} 项被筛选隐藏" : "")
+            + "。完成勾选后点击「保存配置」。";
     }
 
     private static Button IconButton(Button button, string glyph, string label)
@@ -861,30 +932,65 @@ internal sealed class MainWindow : Window
             Tell("请先在左栏勾选要导出的文件类型。", InfoBarSeverity.Informational);
             return;
         }
+        var plan = await RunBackupStage("正在读取备份配置…",
+            progress => ProviderBackup.Prepare(settings.PrepareExport(selection), progress));
+        string summary = $"可随包安装的 DLL（{plan.IncludedComponents.Length}）\n" +
+            string.Join("\n", plan.IncludedComponents);
+        if (plan.BackupOnly.Length > 0)
+            summary += $"\n\n仅备份 DLL，不会自动安装（{plan.BackupOnly.Length}）\n" + string.Join("\n", plan.BackupOnly);
+        if (plan.ConfigurationOnly.Length > 0)
+            summary += $"\n\n未包含组件 DLL（{plan.ConfigurationOnly.Length}）\n" +
+                string.Join("\n", plan.ConfigurationOnly);
+        summary += "\n\n如果组件需要其他文件或原软件，请在目标电脑先安装原组件。";
+        var preview = new ContentDialog
+        {
+            Title = "备份缩略图配置和组件", XamlRoot = root.XamlRoot,
+            Content = new ScrollViewer { MaxHeight = 330, Content = Text(summary, 14) },
+            CloseButtonText = "取消",
+            PrimaryButtonText = "继续保存"
+        };
+        if (await preview.ShowAsync() != ContentDialogResult.Primary) return;
         var path = await DesktopIntegration.PickExportFileAsync(this);
         if (path == null) return;
-        int count = settings.Export(path, selection);
-        int skipped = (selection?.Length ?? count) - count;
+        await RunBackupStage("正在创建 ZIP…", progress => { plan.Save(path, progress); return true; });
         if (selectingForExport) ToggleExportSelection();
-        Tell(skipped == 0 ? $"已导出 {count} 项配置。" : $"已导出 {count} 项，跳过 {skipped} 个没有可用处理器的文件类型。", InfoBarSeverity.Success);
+        Tell($"已保存 ZIP 备份，包含 {plan.ConfigCount} 项配置。", InfoBarSeverity.Success);
+    }
+
+    private async Task<T> RunBackupStage<T>(string initial, Func<IProgress<string>, T> work)
+    {
+        var message = Text(initial, 13);
+        var panel = new StackPanel { Spacing = 8 };
+        panel.Children.Add(new ProgressBar { IsIndeterminate = true });
+        panel.Children.Add(message);
+        var dialog = new ContentDialog { Title = "正在备份", XamlRoot = root.XamlRoot, Content = panel };
+        bool complete = false;
+        dialog.Closing += (_, args) => args.Cancel = !complete;
+        var progress = new Progress<string>(value => { if (!complete) message.Text = value; });
+        var shown = dialog.ShowAsync();
+        try { return await Task.Run(() => work(progress)); }
+        finally
+        {
+            complete = true;
+            dialog.Hide();
+            await shown;
+        }
     }
 
     private async Task ImportAsync()
     {
         var path = await DesktopIntegration.PickImportFileAsync(this);
-        if (path == null) return;
-        var plan = settings.PrepareImport(path);
-        var dialog = new ContentDialog { Title = "导入配置", XamlRoot = root.XamlRoot,
-            Content = new ScrollViewer { MaxHeight = 330, Content = Text(plan.Summary, 14) },
-            CloseButtonText = plan.ChangeCount > 0 ? "取消" : "关闭" };
-        if (plan.ChangeCount > 0) dialog.PrimaryButtonText = "应用";
-        if (await dialog.ShowAsync() == ContentDialogResult.Primary && settings.CommitImport(plan))
-        {
-            ShowDetails();
-            Tell($"已导入 {plan.ChangeCount} 项，跳过 {plan.SkippedCount} 项。可在右栏撤销。", InfoBarSeverity.Success);
-            fileTypes = await Task.Run(ThumbnailSettings.LoadFileTypes);
-            Filter();
-        }
+        if (path != null) await ApplyConfigFileAsync(path);
+    }
+
+    private async Task ApplyConfigFileAsync(string path)
+    {
+        var result = await PreviewConfigImportAsync(path);
+        if (result == null || result.AppliedCount == 0) return;
+        ShowDetails();
+        Tell($"已应用 {result.AppliedCount} 项，跳过 {result.SkippedCount} 项，相同 {result.UnchangedCount} 项。可在右栏撤销。", InfoBarSeverity.Success);
+        fileTypes = await Task.Run(ThumbnailSettings.LoadFileTypes);
+        Filter();
     }
 
     private void UpdateTitleBar()

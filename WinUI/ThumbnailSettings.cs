@@ -38,19 +38,12 @@ internal sealed class ThumbnailSettings
     internal sealed record Entry(object? Value, RegistryValueKind Kind);
     internal sealed record Change(string Key, string Name, Entry Before, Entry After);
 
-    internal sealed class ImportPlan
-    {
-        internal readonly List<Change> Changes;
-        internal ImportPlan(List<Change> changes, int skippedCount, string summary)
-        {
-            Changes = changes;
-            SkippedCount = skippedCount;
-            Summary = summary;
-        }
-        public int ChangeCount => Changes.Count;
-        public int SkippedCount { get; }
-        public string Summary { get; }
-    }
+    internal sealed record ImportOption(Provider Provider, Change? Change);
+    internal sealed record MissingImportItem(string Extension, string ProviderName, string ProviderId, ImportOption[] Replacements);
+    internal sealed record ImportPlan((Change Change, string Description)[] Applicable,
+        string[] Unchanged, MissingImportItem[] Missing);
+    internal sealed record ConfigImportResult(int AppliedCount, int SkippedCount, int UnchangedCount,
+        IReadOnlyDictionary<string, string> Replacements);
 
     public bool CanUndo => history.Count > 0;
 
@@ -124,13 +117,13 @@ internal sealed class ThumbnailSettings
         if (provider is null || CanonicalGuid(provider.Id) is not string id) return null;
         using var root = Registry.ClassesRoot;
         using var key = root.OpenSubKey(@"CLSID\" + id + @"\InprocServer32");
-        return key is null ? null : new Location("所选处理器 · " + provider.Name, key.Name);
+        return key is null ? null : new Location("所选预览处理程序 · " + provider.Name, key.Name);
     }
 
     public bool Apply(string extension, Provider provider)
     {
         if (provider is null || Describe(provider.Id) is not { Exists: true } installed)
-            throw new InvalidOperationException("请选择本机可用的缩略图处理器。");
+            throw new InvalidOperationException("请选择本机可用的预览处理程序。");
         return Commit([Plan(Classes + Normalize(extension) + Slot, "", installed.Id, RegistryValueKind.String)]);
     }
 
@@ -157,24 +150,33 @@ internal sealed class ThumbnailSettings
         return true;
     }
 
-    public int Export(string path, IReadOnlyCollection<string>? selection = null)
+    internal sealed record ExportPlan(string[] Included, string[] Skipped, XDocument Document)
     {
-        using var user = Registry.CurrentUser;
-        using var classes = user.OpenSubKey(Classes.TrimEnd('\\'));
-        var overrides = (classes?.GetSubKeyNames() ?? []).Where(name => ExtensionPattern.IsMatch(name))
-            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
-            .Select(name => (Extension: Normalize(name), Provider: Describe(Read(classes!, name + Slot))))
-            .Where(entry => entry.Provider is not null).ToArray();
-        if (selection != null)
-            overrides = selection.Select(ext => (Extension: Normalize(ext), Provider: Inspect(ext).Effective))
-                .Where(item => item.Provider is { Exists: true }).ToArray();
+        public int Save(string path)
+        {
+            Document.Save(path);
+            return Included.Length;
+        }
+    }
+
+    public ExportPlan PrepareExport(IReadOnlyCollection<string>? selection)
+    {
+        using var classes = Registry.CurrentUser.OpenSubKey(Classes.TrimEnd('\\'));
+        var entries = selection == null
+            ? (classes?.GetSubKeyNames() ?? []).Where(name => ExtensionPattern.IsMatch(name))
+                .Select(name => (Extension: Normalize(name), Provider: Describe(Read(classes!, name + Slot))))
+            : selection.Select(Normalize).Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(ext => (Extension: ext, Provider: Describe(ThumbnailShell.Effective(ext))));
+        var sorted = entries.OrderBy(item => item.Extension, StringComparer.OrdinalIgnoreCase).ToArray();
+        var included = sorted.Where(item => selection == null ? item.Provider != null : item.Provider?.Exists == true).ToArray();
         var root = new XElement("ThumbLab", new XAttribute("version", 1),
-            overrides.Select(item => new XElement("Thumbnail", new XAttribute("extension", item.Extension),
+            included.Select(item => new XElement("Thumbnail", new XAttribute("extension", item.Extension),
                 new XAttribute("provider", item.Provider!.Id), new XAttribute("name", item.Provider.Name))));
         if (selection == null && ReadEntry(Advanced, IconsOnly).Value is int display && display is 0 or 1)
             root.Add(new XElement(IconsOnly, display));
-        new XDocument(root).Save(path);
-        return overrides.Length;
+        return new ExportPlan(included.Select(item => item.Extension).ToArray(),
+            sorted.Select(item => item.Extension).Except(included.Select(item => item.Extension), StringComparer.OrdinalIgnoreCase).ToArray(),
+            new XDocument(root));
     }
 
     public ImportPlan PrepareImport(string path)
@@ -190,10 +192,11 @@ internal sealed class ThumbnailSettings
         if (root is null || root.Name != "ThumbLab" || (string?)root.Attribute("version") != "1")
             throw new InvalidOperationException("无法识别这个 ThumbLab 配置文件。");
 
-        var changes = new List<Change>();
-        var applicable = new List<string>();
-        var skipped = new List<string>();
+        var applicable = new List<(Change, string)>();
+        var unchanged = new List<string>();
+        var missing = new List<MissingImportItem>();
         var extensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string? generic = CanonicalGuid(ThumbnailShell.Effective(".thumblab-unregistered-" + Guid.NewGuid().ToString("N")));
         bool hasDisplay = false;
         foreach (var node in root.Elements())
         {
@@ -210,42 +213,59 @@ internal sealed class ThumbnailSettings
             string extension = Normalize((string?)node.Attribute("extension") ?? "");
             var provider = Describe((string?)node.Attribute("provider"));
             if (provider is null || !extensions.Add(extension))
-                throw new InvalidOperationException("配置含有无效处理器或重复扩展名。");
+                throw new InvalidOperationException("配置含有无效预览处理程序或重复扩展名。");
+            var association = Plan(Classes + extension + Slot, "", provider.Id, RegistryValueKind.String);
+            var effective = CanonicalGuid(ThumbnailShell.Effective(extension));
             if (!provider.Exists)
             {
-                string label = (string?)node.Attribute("name") ?? provider.Name;
-                skipped.Add(extension + "  " + label[..Math.Min(label.Length, 80)] + "  " + provider.Id);
+                string? label = (string?)node.Attribute("name");
+                if (string.IsNullOrWhiteSpace(label)) label = provider.Name;
+                var options = Inspect(extension).Providers.Where(candidate => candidate.Exists
+                        && candidate.Id != generic && candidate.Id != provider.Id)
+                    .Select(candidate =>
+                    {
+                        var change = association with { After = new Entry(candidate.Id, RegistryValueKind.String) };
+                        if (effective == candidate.Id) return new ImportOption(candidate, null);
+                        return NeedsWrite(change) ? new ImportOption(candidate, change) : null;
+                    }).OfType<ImportOption>().ToArray();
+                missing.Add(new MissingImportItem(extension, label[..Math.Min(label.Length, 80)], provider.Id, options));
                 continue;
             }
-            AddChange(Plan(Classes + extension + Slot, "", provider.Id, RegistryValueKind.String),
-                extension + "  →  " + provider.Name);
+            string description = extension + "  →  " + provider.Name;
+            if (effective == provider.Id) unchanged.Add(description);
+            else AddChange(association, description);
         }
 
-        string summary = applicable.Count > 0
-            ? $"将应用 {applicable.Count} 项当前用户设置。\n" + ListPreview(applicable)
-            : "没有需要应用的配置。";
-        if (skipped.Count > 0)
-            summary += $"\n\n本机缺少以下 {skipped.Count} 项组件，导入时会跳过。\n" + ListPreview(skipped);
-        return new ImportPlan(changes, skipped.Count, summary);
+        return new ImportPlan(applicable.ToArray(), unchanged.ToArray(), missing.ToArray());
 
         void AddChange(Change change, string description)
         {
-            if (!NeedsWrite(change)) return;
-            changes.Add(change);
-            applicable.Add(description);
+            if (NeedsWrite(change)) applicable.Add((change, description));
+            else unchanged.Add(description);
         }
     }
 
-    public bool CommitImport(ImportPlan plan)
+    public ConfigImportResult CommitImport(ImportPlan plan, IReadOnlyDictionary<string, ImportOption> choices)
     {
-        foreach (var change in plan.Changes)
+        var changes = plan.Applicable.Select(item => item.Change).ToList();
+        var replacements = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        int unchanged = plan.Unchanged.Length;
+        foreach (var item in plan.Missing)
+        {
+            if (!choices.TryGetValue(item.Extension, out var selected)) continue;
+            if (!item.Replacements.Contains(selected) || Describe(selected.Provider.Id) is not { Exists: true })
+                throw new InvalidOperationException("替代组件已发生变化，请重新打开配置文件。");
+            if (selected.Change is { } change) changes.Add(change);
+            else if (CanonicalGuid(ThumbnailShell.Effective(item.Extension)) == selected.Provider.Id) unchanged++;
+            else throw new InvalidOperationException("本机设置已发生变化，请重新打开配置文件。");
+            replacements.Add(item.Extension, selected.Provider.Name);
+        }
+        foreach (var change in changes)
             if (change.Name != IconsOnly && Describe(change.After.Value as string) is not { Exists: true })
                 throw new InvalidOperationException("导入组件已发生变化，请重新打开配置文件。");
-        return Commit(plan.Changes);
+        Commit(changes);
+        return new ConfigImportResult(changes.Count, plan.Missing.Length - replacements.Count, unchanged, replacements);
     }
-
-    private static string ListPreview(List<string> list) =>
-        string.Join("\n", list.Take(12)) + (list.Count > 12 ? $"\n另有 {list.Count - 12} 项" : "");
 
     private static string? Read(RegistryKey root, string key, string name = "")
     {
@@ -269,7 +289,7 @@ internal sealed class ThumbnailSettings
         if (string.IsNullOrWhiteSpace(name)) name = Read(merged, key);
         if (string.IsNullOrWhiteSpace(name)) name = Read(merged, key + @"\ProgID");
         if (string.IsNullOrWhiteSpace(name)) name = Path.GetFileNameWithoutExtension(server);
-        if (string.IsNullOrWhiteSpace(name)) name = "缩略图处理器";
+        if (string.IsNullOrWhiteSpace(name)) name = "预览处理程序";
         return new Provider(guid, name, server, Path.IsPathFullyQualified(server) && File.Exists(server));
     }
 
@@ -348,5 +368,3 @@ internal sealed class ThumbnailSettings
         finally { ThumbnailShell.Notify(); }
     }
 }
-
-

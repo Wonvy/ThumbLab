@@ -61,9 +61,9 @@ internal static class DesktopIntegration
     {
         var picker = new FileSavePicker(window.AppWindow.Id)
         {
-            SuggestedFileName = "ThumbLab",
-            DefaultFileExtension = ".thumblab",
-            FileTypeChoices = { { "ThumbLab 配置", new List<string> { ".thumblab" } } }
+            SuggestedFileName = "ThumbLab-Backup",
+            DefaultFileExtension = ".zip",
+            FileTypeChoices = { { "ThumbLab 备份", new List<string> { ".zip" } } }
         };
         return (await picker.PickSaveFileAsync())?.Path;
     }
@@ -83,7 +83,7 @@ internal static class DesktopIntegration
     public static void SelectProviderFile(string path)
     {
         if (!File.Exists(path))
-            throw new FileNotFoundException("所选处理器的文件在本机不可用。", path);
+            throw new FileNotFoundException("所选预览处理程序的文件在本机不可用。", path);
 
         Marshal.ThrowExceptionForHR(SHParseDisplayName(path, IntPtr.Zero, out IntPtr item, 0, IntPtr.Zero));
         try
@@ -110,4 +110,3 @@ internal static class DesktopIntegration
     [DllImport("shell32.dll", ExactSpelling = true)]
     private static extern int SHOpenFolderAndSelectItems(IntPtr item, uint count, IntPtr children, uint flags);
 }
-
