@@ -1,0 +1,20 @@
+%
+(Two contours with a rapid traverse between them)
+G21 G90 G17
+G0 Z4
+G0 X30 Y0
+G1 Z-1 F100
+G1 X60 Y25 F320
+X30 Y50
+X0 Y25
+X30 Y0
+G0 Z4
+G0 X30 Y12
+G1 Z-1 F100
+G1 X45 Y25 F320
+X30 Y38
+X15 Y25
+X30 Y12
+G0 Z4
+M30
+%
